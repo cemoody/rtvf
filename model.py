@@ -59,11 +59,12 @@ def gumbel_softmax_sample(input, dim=0, temperature=.1, noise=None):
 
 
 class RTVF(nn.Module):
-    def __init__(self, n_frames, n_pixels, n_channels, lmbda=1e-2, ltv=1e-3):
+    def __init__(self, n_frames, n_pixels, n_channels, k=1, l1=1e-4,
+                 lmbda=1e-2, ltv=1e-3):
         super().__init__()
         self.B = nn.Parameter(torch.randn(n_pixels, n_pixels, 3))
-        self.V = nn.Parameter(torch.randn(n_pixels, n_channels))
-        self.C = nn.Parameter(torch.randn(n_frames, n_channels))
+        self.V = nn.Parameter(torch.randn(k, n_pixels, n_pixels, n_channels))
+        self.C = nn.Parameter(torch.randn(n_frames, k))
         self.Mmu = nn.Parameter(torch.randn(n_frames, n_pixels, n_pixels) - 2.)
         self.Mlv = nn.Parameter(torch.randn(n_frames, n_pixels, n_pixels))
         self.H = nn.Parameter(torch.randn(n_frames, n_pixels, n_pixels,
@@ -71,6 +72,7 @@ class RTVF(nn.Module):
         self.lmbda = lmbda
         self.n_frames = n_frames
         self.ltv = ltv
+        self.l1 = l1
 
     def soft_image(self, index=None, bg_only=False):
         if index is None:
@@ -79,13 +81,15 @@ class RTVF(nn.Module):
             return self.B[None, ...]
         # self.V is (nx, k)
         # V is (k, nx, nx)
-        V = self.V.t()[:, None, :] * self.V.t()[:, :, None]
+        # V = self.V.t()[:, None, :] * self.V.t()[:, :, None]
+        # cV = self.C[index] @ self.V
+        cV = self.C[index][..., None, None] * self.V
         # V is (1, nx, nx, k)
-        V = torch.transpose(V, 0, 2)[None, ...]
+        # V = torch.transpose(V, 0, 2)[None, ...]
         # c is (bs, 1, 1, k)
-        c = self.C[index][:, None, None, :]
+        # c = self.C[index][:, None, None, :]
         # cV is (bs, nx, nx, k)
-        cV = c * V
+        # cV = c * V
         return self.B[None, ...] + cV
 
     def hard_image(self, index=None):
@@ -113,14 +117,15 @@ class RTVF(nn.Module):
         # log likelihood of observed image
         llh = (img - prediction).norm(2).sum()
         # L2 Regularize V, c
-        l2a = self.V.norm(2) + self.C.norm(2)
-        # L2 Regualrize H
-        l2b = self.H.norm(2) + self.C.norm(2)
+        la = self.V.norm(2) + self.C.norm(2)
+        # L1 Regualrize H
+        lb = self.H.norm(1) * self.l1
         # TV regularize M
         tv = total_variation(self.Mmu) * self.ltv
         # l1 regularize M
-        l1 = torch.abs(torch.sigmoid(self.Mmu)).sum()
-        return llh + (self.lmbda * (l2a + l2b + tv + l1) /
+        l1 = torch.abs(torch.sigmoid(self.Mmu)).sum() * self.l1
+        # import pdb; pdb.set_trace()
+        return llh + (self.lmbda * (la + lb + tv + l1) /
                       self.n_frames * len(index))
 
 
