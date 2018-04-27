@@ -59,7 +59,7 @@ def gumbel_softmax_sample(input, dim=0, temperature=.1, noise=None):
 
 
 class RTVF(nn.Module):
-    def __init__(self, n_frames, n_pixels, n_channels, lmbda=1e-2):
+    def __init__(self, n_frames, n_pixels, n_channels, lmbda=1e-2, ltv=1e-3):
         super().__init__()
         self.B = nn.Parameter(torch.randn(n_pixels, n_pixels, 3))
         self.V = nn.Parameter(torch.randn(n_pixels, n_channels))
@@ -70,64 +70,58 @@ class RTVF(nn.Module):
                                           n_channels))
         self.lmbda = lmbda
         self.n_frames = n_frames
+        self.ltv = ltv
 
     def soft_image(self, index=None, bg_only=False):
         if index is None:
             index = Variable(torch.arange(0, self.n_frames).long())
         if bg_only:
-            return torch.sigmoid(self.B[None, ...])
+            return self.B[None, ...]
         # self.V is (nx, k)
         # V is (k, nx, nx)
         V = self.V.t()[:, None, :] * self.V.t()[:, :, None]
         # V is (1, nx, nx, k)
-        V = torch.sigmoid(torch.transpose(V, 0, 2)[None, ...])
+        V = torch.transpose(V, 0, 2)[None, ...]
         # c is (bs, 1, 1, k)
         c = self.C[index][:, None, None, :]
         # cV is (bs, nx, nx, k)
         cV = c * V
-        return torch.sigmoid(self.B[None, ...]) + cV
+        return self.B[None, ...] + cV
 
     def hard_image(self, index=None):
         if index is None:
             index = Variable(torch.arange(0, self.n_frames).long())
-        return torch.sigmoid(self.H[index])
-
-    def mask(self, index=None, temperature=0.5):
-        if index is None:
-            index = Variable(torch.arange(0, self.n_frames).long())
-        m = self.M[index]
-        logits = torch.cat((m[None, ...], -m[None, ...]))
-        # Sample with correlated noise
-        corr_noise = sample_gumbel(1).expand_as(logits)
-        p = gumbel_softmax_sample(logits, dim=0, temperature=temperature,
-                                  noise=corr_noise)[0]
-        return p
+        return self.H[index]
 
     def mask_multiply(self, index, image, sign=1.0):
-        mu = self.Mmu[index][..., None] * sign
+        mu = torch.sigmoid(self.Mmu[index][..., None] * sign)
         lv = self.Mlv[index][..., None]
         noise = Variable(torch.rand(lv.size()))
+        mi = mu * image
         vi = torch.exp(lv) * image * image
-        sample = mu + vi * noise
+        sample = mi + vi * noise
         return sample
 
     def forward(self, index, img):
         S = self.soft_image(index)
         H = self.hard_image(index)
-        SM = self.mask_multiply(index, S)
-        HM = self.mask_multiply(index, H, sign=-1.0)
-        return SM + HM
+        SM = self.mask_multiply(index, S, sign=-1.0)
+        HM = self.mask_multiply(index, H)
+        return torch.sigmoid(SM + HM)
 
     def loss(self, prediction, index, img):
         # log likelihood of observed image
         llh = (img - prediction).norm(2).sum()
         # L2 Regularize V, c
-        l2 = self.V.norm(2) + self.C.norm(2)
+        l2a = self.V.norm(2) + self.C.norm(2)
+        # L2 Regualrize H
+        l2b = self.H.norm(2) + self.C.norm(2)
         # TV regularize M
-        tv = total_variation(self.M)
+        tv = total_variation(self.Mmu) * self.ltv
         # l1 regularize M
-        l1 = torch.abs(torch.sigmoid(self.M)).sum()
-        return llh + self.lmbda * (l2 + tv + l1) / self.n_frames * len(index)
+        l1 = torch.abs(torch.sigmoid(self.Mmu)).sum()
+        return llh + (self.lmbda * (l2a + l2b + tv + l1) /
+                      self.n_frames * len(index))
 
 
 def fit(X, n_epochs=100):
@@ -136,15 +130,18 @@ def fit(X, n_epochs=100):
     model = RTVF(n_frames, n_pixels, n_channels)
     optim = Adam(model.parameters(), lr=1e-1)
     callbacks = {'rms': rms_callback}
-    t = Trainer(model, optim, batchsize=128, callbacks=callbacks, seed=42,
-                print_every=1)
+    t = Trainer(model, optim, batchsize=32, callbacks=callbacks,
+                seed=42, print_every=1)
     for epoch in range(n_epochs):
         t.fit(index, X)
         background = model.soft_image(bg_only=True)
         foreground = model.hard_image()
-        mask = model.mask(temperature=1.0)
+        mask = torch.sigmoid(model.Mmu)
         mask = mask.data.numpy()
         bg = background.data.numpy()
         fg = foreground.data.numpy()
         np.savez("checkpoint", bg=bg, fg=fg, mask=mask)
+        if epoch > 4:
+            optim.lr = 1e-4
+            t.batchsize = 128
     return bg, fg, mask
