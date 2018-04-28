@@ -59,10 +59,15 @@ def gumbel_softmax_sample(input, dim=0, temperature=.1, noise=None):
 
 
 class RTVF(nn.Module):
-    def __init__(self, n_frames, n_pixels, n_channels, k=1, l1=1e-4,
-                 lmbda=1e-2, ltv=1e-3):
+    def __init__(self, n_frames, n_pixels, n_channels, k=1, l1=1e-2,
+                 lmbda=1e-2, ltv=1e-3, setB=None):
         super().__init__()
-        self.B = nn.Parameter(torch.randn(n_pixels, n_pixels, 3))
+        if setB is not None:
+            print("Fixing background image")
+            self.B = torch.from_numpy(np.log(setB / (1 - setB + 1e-6)))
+            # self.B = torch.from_numpy(setB)
+        else:
+            self.B = nn.Parameter(torch.randn(n_pixels, n_pixels, 3))
         self.V = nn.Parameter(torch.randn(k, n_pixels, n_pixels, n_channels))
         self.C = nn.Parameter(torch.randn(n_frames, k))
         self.Mmu = nn.Parameter(torch.randn(n_frames, n_pixels, n_pixels) - 2.)
@@ -77,20 +82,21 @@ class RTVF(nn.Module):
     def soft_image(self, index=None, bg_only=False):
         if index is None:
             index = Variable(torch.arange(0, self.n_frames).long())
+        B = Variable(self.B)
         if bg_only:
-            return self.B[None, ...]
+            return B[None, ...]
         # self.V is (nx, k)
         # V is (k, nx, nx)
         # V = self.V.t()[:, None, :] * self.V.t()[:, :, None]
         # cV = self.C[index] @ self.V
-        cV = self.C[index][..., None, None] * self.V
+        cV = (self.C[index][..., None, None, None] * self.V[None, ...]).sum(1)
         # V is (1, nx, nx, k)
         # V = torch.transpose(V, 0, 2)[None, ...]
         # c is (bs, 1, 1, k)
         # c = self.C[index][:, None, None, :]
         # cV is (bs, nx, nx, k)
         # cV = c * V
-        return self.B[None, ...] + cV
+        return B[None, ...] + cV
 
     def hard_image(self, index=None):
         if index is None:
@@ -109,9 +115,9 @@ class RTVF(nn.Module):
     def forward(self, index, img):
         S = self.soft_image(index)
         H = self.hard_image(index)
-        SM = self.mask_multiply(index, S, sign=-1.0)
-        HM = self.mask_multiply(index, H)
-        return torch.sigmoid(SM + HM)
+        SM = self.mask_multiply(index, torch.sigmoid(S), sign=-1.0)
+        HM = self.mask_multiply(index, torch.sigmoid(H))
+        return SM + HM
 
     def loss(self, prediction, index, img):
         # log likelihood of observed image
@@ -124,7 +130,6 @@ class RTVF(nn.Module):
         tv = total_variation(self.Mmu) * self.ltv
         # l1 regularize M
         l1 = torch.abs(torch.sigmoid(self.Mmu)).sum() * self.l1
-        # import pdb; pdb.set_trace()
         return llh + (self.lmbda * (la + lb + tv + l1) /
                       self.n_frames * len(index))
 
@@ -132,7 +137,8 @@ class RTVF(nn.Module):
 def fit(X, n_epochs=100):
     n_frames, n_pixels, _, n_channels = X.shape
     index = np.arange(n_frames)
-    model = RTVF(n_frames, n_pixels, n_channels)
+    B = X[-1]
+    model = RTVF(n_frames, n_pixels, n_channels, setB=B, k=2)
     optim = Adam(model.parameters(), lr=1e-1)
     callbacks = {'rms': rms_callback}
     t = Trainer(model, optim, batchsize=32, callbacks=callbacks,
@@ -145,7 +151,7 @@ def fit(X, n_epochs=100):
         mask = mask.data.numpy()
         bg = background.data.numpy()
         fg = foreground.data.numpy()
-        np.savez("checkpoint", bg=bg, fg=fg, mask=mask)
+        np.savez("checkpoint2", bg=bg, fg=fg, mask=mask)
         if epoch > 4:
             optim.lr = 1e-4
             t.batchsize = 128
