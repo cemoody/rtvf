@@ -115,21 +115,28 @@ class RTVF(nn.Module):
         sample = mi + vi * noise
         return sample
 
-    def mask_multiply_fused(self, index, image, sign=1.0):
-        mu = self.Mmu[index]
+    def mask_fused(self, index, sign=1.0):
+        mu = self.Mmu[index].contiguous()
+        mut = torch.transpose(mu, 1, 2).contiguous()
         bs, nx, nx = mu.shape
-        flat = mu.view(bs, nx * nx)
-        fused = torch.sigmoid(self.fused(flat) * sign)
-        square = fused.view(bs, nx, nx)
-        mi = square * image
-        return mi
+        # Fuse horizontally
+        flat1 = mu.view(bs, nx * nx)
+        fused1 = self.fused(flat1).view(bs, nx, nx)
+        # Fuse vertically
+        flat2 = mut.view(bs, nx * nx)
+        fused2 = self.fused(flat2).view(bs, nx, nx)
+        square = torch.sigmoid((fused1 + fused2 * sign))
+        return square[..., None]
 
     def forward(self, index, img):
+        # SM = self.mask_multiply_fused(index, torch.sigmoid(S), sign=-1.0)
+        # HM = self.mask_multiply_fused(index, torch.sigmoid(H))
+        # return SM + HM
         S = self.soft_image(index)
         H = self.hard_image(index)
-        SM = self.mask_multiply_fused(index, torch.sigmoid(S), sign=-1.0)
-        HM = self.mask_multiply_fused(index, torch.sigmoid(H))
-        return SM + HM
+        M = self.mask_fused(index)
+        I = S * (1 - M) + H * M
+        return I
 
     def loss(self, prediction, index, img):
         # log likelihood of observed image
@@ -153,8 +160,8 @@ def fit(X, n_epochs=10000):
     model = RTVF(n_frames, n_pixels, n_channels, setB=B, k=2)
     optim = Adam(model.parameters(), lr=1e-1)
     callbacks = {'rms': rms_callback}
-    t = Trainer(model, optim, batchsize=32, callbacks=callbacks,
-                seed=42, print_every=1)
+    t = Trainer(model, optim, batchsize=32, callbacks=callbacks, seed=42,
+                print_every=1, backward_kwargs=dict(retain_graph=True))
     for epoch in range(n_epochs):
         t.fit(index, X)
         background = model.soft_image(bg_only=True)
