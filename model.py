@@ -8,6 +8,8 @@ from torch.optim import Adam
 from torch.autograd import Variable
 import torch.nn.functional as F
 
+from torchsparseattn.fused import FusedProxFunction
+
 
 # V shape is [n_frames, nx, nx]
 # V is deconvolutional from latent
@@ -78,6 +80,7 @@ class RTVF(nn.Module):
         self.n_frames = n_frames
         self.ltv = ltv
         self.l1 = l1
+        self.fused = FusedProxFunction()
 
     def soft_image(self, index=None, bg_only=False):
         if index is None:
@@ -112,29 +115,38 @@ class RTVF(nn.Module):
         sample = mi + vi * noise
         return sample
 
+    def mask_multiply_fused(self, index, image, sign=1.0):
+        mu = self.Mmu[index]
+        bs, nx, nx = mu.shape
+        flat = mu.view(bs, nx * nx)
+        fused = torch.sigmoid(self.fused(flat) * sign)
+        square = fused.view(bs, nx, nx)
+        mi = square * image
+        return mi
+
     def forward(self, index, img):
         S = self.soft_image(index)
         H = self.hard_image(index)
-        SM = self.mask_multiply(index, torch.sigmoid(S), sign=-1.0)
-        HM = self.mask_multiply(index, torch.sigmoid(H))
+        SM = self.mask_multiply_fused(index, torch.sigmoid(S), sign=-1.0)
+        HM = self.mask_multiply_fused(index, torch.sigmoid(H))
         return SM + HM
 
     def loss(self, prediction, index, img):
         # log likelihood of observed image
-        llh = (img - prediction).norm(2).sum()
+        llh = (img - prediction).norm(1).sum()
         # L2 Regularize V, c
         la = self.V.norm(2) + self.C.norm(2)
         # L1 Regualrize H
         lb = self.H.norm(1) * self.l1
         # TV regularize M
-        tv = total_variation(self.Mmu) * self.ltv
+        # tv = total_variation(self.Mmu) * self.ltv
         # l1 regularize M
         l1 = torch.abs(torch.sigmoid(self.Mmu)).sum() * self.l1
-        return llh + (self.lmbda * (la + lb + tv + l1) /
+        return llh + (self.lmbda * (la + lb + l1) /
                       self.n_frames * len(index))
 
 
-def fit(X, n_epochs=100):
+def fit(X, n_epochs=10000):
     n_frames, n_pixels, _, n_channels = X.shape
     index = np.arange(n_frames)
     B = X[-1]
